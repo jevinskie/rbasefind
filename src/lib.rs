@@ -2,13 +2,15 @@ extern crate byteorder;
 extern crate clap;
 extern crate fnv;
 extern crate num_cpus;
-extern crate regex;
-extern crate pbr;
 extern crate ocl;
+extern crate pbr;
+extern crate regex;
 
 use byteorder::{BigEndian, LittleEndian, ReadBytesExt};
-use clap::App;
+use clap::Parser;
 use fnv::FnvHashSet;
+use ocl::{Buffer, Context, Device, Kernel, MemFlags, Program, Queue, SpatialDims};
+use pbr::MultiBar;
 use regex::bytes::Regex;
 use std::collections::BinaryHeap;
 use std::error::Error;
@@ -17,81 +19,27 @@ use std::io::Cursor;
 use std::io::prelude::*;
 use std::sync::Arc;
 use std::thread;
-use pbr::MultiBar;
-use ocl::{Context, Queue, Device, Program, Buffer, MemFlags, Kernel, SpatialDims};
 
+#[derive(Parser, Debug)]
+#[command(
+    author,
+    version,
+    about = "Scan a flat 32-bit binary and attempt to brute-force the base address via string/pointer comparison. Based on the excellent basefind.py by mncoppola."
+)]
 pub struct Config {
+    #[arg(short, long)]
     big_endian: bool,
-    filename: String,
+    #[arg(long, default_value_t = 10)]
     min_str_len: usize,
+    #[arg(long, default_value_t = 10)]
     max_matches: usize,
+    #[arg(short, long, default_value_t = 0x1000)]
     offset: u32,
+    #[arg(short, long, default_value_t = num_cpus::get())]
     threads: usize,
+    #[arg(short = 'c', long)]
     opencl: bool,
-}
-
-impl Config {
-    pub fn new() -> Result<Config, &'static str> {
-        let arg_matches = App::new("rbasefind")
-            .version("0.1.2")
-            .author("Scott G. <github.scott@gmail.com>")
-            .about(
-                "Scan a flat 32-bit binary and attempt to brute-force the base address via \
-                 string/pointer comparison. Based on the excellent basefind.py by mncoppola.",
-            )
-            .args_from_usage(
-                "<INPUT>                'The input binary to scan'
-                -b, --bigendian         'Interpret as Big Endian (default is little)'
-                -m, --minstrlen=[LEN]   'Minimum string search length (default is 10)'
-                -n, --maxmatches=[LEN]   'Maximum matches to display (default is 10)'
-                -o, --offset=[LEN]      'Scan every N (power of 2) addresses. (default is 0x1000)'
-                -t  --threads=[NUM_THREADS] '# of threads to spawn. (default is # of cpu cores)'
-                -c  --opencl                'Use OpenCL for the search'",
-            )
-            .get_matches();
-
-        let config = Config {
-            big_endian: arg_matches.is_present("bigendian"),
-            filename: arg_matches.value_of("INPUT").unwrap().to_string(),
-            max_matches: match arg_matches.value_of("maxmatches").unwrap_or("10").parse() {
-                Ok(v) => v,
-                Err(_) => return Err("failed to parse maxmatches"),
-            },
-            min_str_len: match arg_matches.value_of("minstrlen").unwrap_or("10").parse() {
-                Ok(v) => v,
-                Err(_) => return Err("failed to parse minstrlen"),
-            },
-            offset: {
-                let offset_str = &arg_matches.value_of("offset").unwrap_or("0x1000");
-                if offset_str.len() <= 2 {
-                    return Err("offset format is invalid");
-                }
-                if &offset_str[0..2] != "0x" {
-                    return Err("ensure offset parameter begins with 0x.");
-                }
-                let offset_num = match u32::from_str_radix(&offset_str[2..], 16) {
-                    Ok(v) => v,
-                    Err(_) => return Err("failed to parse offset"),
-                };
-                // This check also prevents offset_num from being zero.
-                if offset_num.count_ones() != 1 {
-                    return Err("Offset is not a power of 2");
-                }
-                offset_num
-            },
-            threads: match arg_matches.value_of("threads").unwrap_or("0").parse() {
-                Ok(v) => if v == 0 {
-                    num_cpus::get()
-                } else {
-                    v
-                },
-                Err(_) => return Err("failed to parse threads"),
-            },
-            opencl: arg_matches.is_present("opencl"),
-        };
-
-        Ok(config)
-    }
+    filename: String,
 }
 
 pub struct Interval {
@@ -113,15 +61,13 @@ impl Interval {
             return Err("Invalid additive offset".into());
         }
 
-        let mut start_addr = index as u64
-            * ((u64::from(u32::max_value()) + max_threads as u64 - 1) / max_threads as u64);
-        let mut end_addr = (index as u64 + 1)
-            * ((u64::from(u32::max_value()) + max_threads as u64 - 1) / max_threads as u64);
+        let mut start_addr = index as u64 * u64::from(u32::MAX).div_ceil(max_threads as u64);
+        let mut end_addr = (index as u64 + 1) * u64::from(u32::MAX).div_ceil(max_threads as u64);
 
         // Mask the address such that it's aligned to the 2^N offset.
         start_addr &= !(u64::from(offset) - 1);
-        if end_addr >= u64::from(u32::max_value()) {
-            end_addr = u64::from(u32::max_value());
+        if end_addr >= u64::from(u32::MAX) {
+            end_addr = u64::from(u32::MAX);
         } else {
             end_addr &= !(u64::from(offset) - 1);
         }
@@ -139,7 +85,7 @@ fn get_strings(config: &Config, buffer: &[u8]) -> Result<Vec<u32>, Box<dyn Error
     let mut strings = Vec::<u32>::new();
 
     let reg_str = format!("[ -~\\t\\r\\n]{{{},}}\x00", config.min_str_len);
-    for mat in Regex::new(&reg_str)?.find_iter(&buffer[..]) {
+    for mat in Regex::new(&reg_str)?.find_iter(buffer) {
         strings.push(mat.start() as u32);
     }
 
@@ -174,7 +120,7 @@ fn find_matches(
     let interval = Interval::get_range(scan_interval, config.threads, config.offset)?;
     let mut current_addr = interval.start_addr;
     let mut heap = BinaryHeap::<(usize, u32)>::new();
-    pb.total = ((interval.end_addr - interval.start_addr)/config.offset) as u64;
+    pb.total = ((interval.end_addr - interval.start_addr) / config.offset) as u64;
     while current_addr <= interval.end_addr {
         let mut news = FnvHashSet::default();
         for s in strings {
@@ -200,7 +146,11 @@ fn find_matches(
     Ok(heap)
 }
 
-fn cpu_search(config: &Arc<Config>, strings: &Arc<Vec<u32>>, pointers: &Arc<FnvHashSet<u32>>) -> BinaryHeap::<(usize, u32)> {
+fn cpu_search(
+    config: &Arc<Config>,
+    strings: &Arc<Vec<u32>>,
+    pointers: &Arc<FnvHashSet<u32>>,
+) -> BinaryHeap<(usize, u32)> {
     let mut children = vec![];
 
     let mb = MultiBar::new();
@@ -208,9 +158,9 @@ fn cpu_search(config: &Arc<Config>, strings: &Arc<Vec<u32>>, pointers: &Arc<FnvH
     for i in 0..config.threads {
         let mut pb = mb.create_bar(100);
         pb.show_message = true;
-        let child_config = Arc::clone(&config);
-        let child_strings = Arc::clone(&strings);
-        let child_pointers = Arc::clone(&pointers);
+        let child_config = Arc::clone(config);
+        let child_strings = Arc::clone(strings);
+        let child_pointers = Arc::clone(pointers);
         children.push(thread::spawn(move || {
             find_matches(&child_config, &child_strings, &child_pointers, i, pb)
         }));
@@ -227,13 +177,17 @@ fn cpu_search(config: &Arc<Config>, strings: &Arc<Vec<u32>>, pointers: &Arc<FnvH
     heap
 }
 
-fn opencl_search(config: &Arc<Config>, strings: &Vec<u32>, pointers: &Vec<u32>) -> BinaryHeap::<(usize, u32)> {
+fn opencl_search(
+    config: &Arc<Config>,
+    strings: &[u32],
+    pointers: &[u32],
+) -> BinaryHeap<(usize, u32)> {
     let compute_program = r#"
-        __kernel void find(__global read_only uint* strings, 
+        __kernel void find(__global uint* strings, 
         ulong str_count, 
-        __global read_only uint* pointers,
+        __global uint* pointers,
         ulong ptr_count,
-        __global write_only uint* results) {
+        __global uint* results) {
             uint current_addr = get_global_id(0) * 0x1000;
             uint intersect_count = 0;
             for (uint i=0; i<str_count; i++) {
@@ -253,8 +207,14 @@ fn opencl_search(config: &Arc<Config>, strings: &Vec<u32>, pointers: &Vec<u32>) 
     if config.offset != 0x1000 {
         panic!("in opencl mode we support only 0x1000 offset");
     }
-    let context = Context::builder().devices(Device::specifier()
-        .type_flags(ocl::flags::DEVICE_TYPE_GPU).first()).build().unwrap();
+    let context = Context::builder()
+        .devices(
+            Device::specifier()
+                .type_flags(ocl::flags::DEVICE_TYPE_GPU)
+                .first(),
+        )
+        .build()
+        .unwrap();
 
     let device = context.devices()[0];
     let queue = Queue::new(&context, device, None).unwrap();
@@ -268,21 +228,24 @@ fn opencl_search(config: &Arc<Config>, strings: &Vec<u32>, pointers: &Vec<u32>) 
         .queue(queue.clone())
         .flags(MemFlags::new().read_only())
         .len(strings.len())
-        .copy_host_slice(&strings)
-        .build().expect("cannot build the strings buffer");
+        .copy_host_slice(strings)
+        .build()
+        .expect("cannot build the strings buffer");
 
     let pointer_buffer = Buffer::<u32>::builder()
         .queue(queue.clone())
         .flags(MemFlags::new().read_only())
         .len(pointers.len())
-        .copy_host_slice(&pointers)
-        .build().expect("cannot build the pointers buffer");
+        .copy_host_slice(pointers)
+        .build()
+        .expect("cannot build the pointers buffer");
 
     let result_buffer = Buffer::<u32>::builder()
         .queue(queue.clone())
         .flags(MemFlags::new().write_only())
         .len(0x100000)
-        .build().expect("cannot build the results buffer");
+        .build()
+        .expect("cannot build the results buffer");
 
     let kernel = Kernel::builder()
         .program(&program)
@@ -294,19 +257,21 @@ fn opencl_search(config: &Arc<Config>, strings: &Vec<u32>, pointers: &Vec<u32>) 
         .arg_named("pointers", &pointer_buffer)
         .arg_named("ptr_count", pointer_buffer.len())
         .arg_named("results", &result_buffer)
-        .build().unwrap();
+        .build()
+        .unwrap();
 
-    unsafe { kernel.enq().unwrap(); }
+    unsafe {
+        kernel.enq().unwrap();
+    }
 
     let mut vec_result = vec![0u32; result_buffer.len()];
     result_buffer.read(&mut vec_result).enq().unwrap();
 
     queue.finish().unwrap();
     let mut heap = BinaryHeap::<(usize, u32)>::new();
-    for page in 0..(0x100000) {
-        let count = vec_result[page];
-        if count > 0 {
-            heap.push((count as usize, (page*0x1000) as u32));
+    for (page, count) in vec_result.iter().enumerate().take(0x100000) {
+        if *count > 0 {
+            heap.push((*count as usize, (page * 0x1000) as u32));
         }
     }
     heap
@@ -331,8 +296,7 @@ pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
 
     let shared_config = Arc::new(config);
 
-
-    let mut heap = if shared_config.opencl{
+    let mut heap = if shared_config.opencl {
         let mut pointers_vec = Vec::<u32>::new();
         for p in pointers {
             pointers_vec.push(p);
@@ -369,14 +333,14 @@ mod tests {
     #[test]
     fn find_matches_single_cpu_interval_0() {
         let interval = Interval::get_range(0, 1, 0x1000).unwrap();
-        assert_eq!(interval.start_addr, u32::min_value());
-        assert_eq!(interval.end_addr, u32::max_value());
+        assert_eq!(interval.start_addr, u32::MIN);
+        assert_eq!(interval.end_addr, u32::MAX);
     }
 
     #[test]
     fn find_matches_double_cpu_interval_0() {
         let interval = Interval::get_range(0, 2, 0x1000).unwrap();
-        assert_eq!(interval.start_addr, u32::min_value());
+        assert_eq!(interval.start_addr, u32::MIN);
         assert_eq!(interval.end_addr, 0x80000000);
     }
 
@@ -384,13 +348,13 @@ mod tests {
     fn find_matches_double_cpu_interval_1() {
         let interval = Interval::get_range(1, 2, 0x1000).unwrap();
         assert_eq!(interval.start_addr, 0x80000000);
-        assert_eq!(interval.end_addr, u32::max_value());
+        assert_eq!(interval.end_addr, u32::MAX);
     }
 
     #[test]
     fn find_matches_triple_cpu_interval_0() {
         let interval = Interval::get_range(0, 3, 0x1000).unwrap();
-        assert_eq!(interval.start_addr, u32::min_value());
+        assert_eq!(interval.start_addr, u32::MIN);
         assert_eq!(interval.end_addr, 0x55555000);
     }
 
@@ -405,6 +369,6 @@ mod tests {
     fn find_matches_triple_cpu_interval_2() {
         let interval = Interval::get_range(2, 3, 0x1000).unwrap();
         assert_eq!(interval.start_addr, 0xAAAAA000);
-        assert_eq!(interval.end_addr, u32::max_value());
+        assert_eq!(interval.end_addr, u32::MAX);
     }
 }

@@ -1,15 +1,15 @@
 [package]
 authors = ["github.scott@gmail.com"]
-edition = "2021"
+edition = "2024"
 name = "rbasefind"
 version = "0.3.0"
 
 [dependencies]
 byteorder = "1.5.0"
 clap = "4"
-env_logger = "0.11.3"
+env_logger = "0.11.6"
 fnv = "1.0.7"
-log = "0.4.21"
+log = "0.4.22"
 num_cpus = "1.16.0"
 pbr = "1.1.1"
-regex = "1.10.4"
+regex = "1.11.1"
